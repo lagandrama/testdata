@@ -1,0 +1,7 @@
+version: '3.8'
+services:
+  health-sync:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped

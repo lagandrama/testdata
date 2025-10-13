@@ -1,0 +1,27 @@
+# secrets & env
+.env
+secrets/
+*.pem
+*.key
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Tools/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Playwright/other temp (if applicable)
+playwright/.cache/
+
+`n# secrets`nsecrets/`n.env`n
