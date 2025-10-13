@@ -1,3 +1,7 @@
 Flask
 requests
 python-dotenv
+tenacity>=8.2
+pydantic>=2.4
+pydantic-settings>=2.0
+python-dotenv
