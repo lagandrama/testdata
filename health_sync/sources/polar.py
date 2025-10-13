@@ -3,13 +3,10 @@ from __future__ import annotations
 
 import datetime as dt
 import os
-from typing import Optional, List, Tuple
+from typing import Optional, List, Any, Dict, Tuple
 
 import httpx
 import structlog
-
-from ..models import UnifiedRow
-from ..utils import iso_date, seconds_to_minutes
 from ..config import get_settings
 
 logger = structlog.get_logger()
@@ -46,177 +43,261 @@ def _parse_iso(ts: Optional[str]) -> Optional[dt.datetime]:
         return None
 
 
-def _only_hms(ts: Optional[str]) -> Optional[str]:
+def parse_iso_to_local_time(ts: Optional[str]) -> str:
     t = _parse_iso(ts)
-    return t.strftime("%H:%M:%S") if t else None
+    return t.strftime("%H:%M:%S") if t else ""
 
 
-def _coalesce(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
+def _list_payload_items(js: Any) -> List[dict]:
+    """Vrati listu itema ako je response list/obj s listom pod uobičajenim ključevima."""
+    if not js:
+        return []
+    if isinstance(js, list):
+        return js
+    if isinstance(js, dict):
+        for key in (
+            "data", "items", "sleep", "nights", "summaries",
+            "recharges",                         # <— GLAVNI FIX
+            "activity-log", "activities", "activity", "results",
+            "activity_summary", "summary", "metrics"
+        ):
+            v = js.get(key)
+            if isinstance(v, list):
+                return v
+    return []
 
 
-def _min_to_hhmm(m: Optional[int]) -> Optional[str]:
-    if m is None:
-        return None
-    m = int(m)
-    h, mm = divmod(m, 60)
-    return f"{h:02d}:{mm:02d}"
-
-
-def _get_json(client: httpx.Client, url: str, params: dict | None = None) -> Tuple[int, dict | list | None]:
-    r = client.get(url, headers=_auth_headers(), params=params or {})
-    if r.status_code == 404:
-        return 404, None
-    r.raise_for_status()
-    try:
-        return r.status_code, r.json()
-    except Exception:
-        return r.status_code, None
-
-
-# --------------------------- Mapping: Sleep ---------------------------
-
-def _extract_sleep_fields_polar(obj: dict) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
-    """
-    Vrati (asleep_start_iso, asleep_end_iso, duration_sec, sleep_score) iz Polar sleep objekta.
-    Podržava više naziva polja (različite verzije Polar podataka).
-    """
-    start = _coalesce(obj.get("sleep_start_time"), obj.get("start_time"), obj.get("bedtime_start"))
-    end   = _coalesce(obj.get("sleep_end_time"),   obj.get("end_time"),   obj.get("bedtime_end"))
-    dur_s = _coalesce(obj.get("total_sleep_time"), obj.get("actual_sleep_time"), obj.get("duration"))
-    try:
-        dur_s = int(dur_s) if dur_s is not None else None
-    except Exception:
-        pass
-    score = _coalesce(obj.get("sleep_score"), obj.get("score"))
-    return start, end, dur_s, score
-
-
-def _pick_record_for_day(items: List[dict], day: dt.date) -> dict:
-    """
-    Odaberi zapis koji pripada danu:
-    1) preferiramo onaj kojem 'end' pada unutar [00:00, +1d),
-    2) fallback: maksimalni preklop sa danom.
-    """
+def _pick_record_for_day(items: List[dict], day: dt.date,
+                         date_field: Optional[str] = None,
+                         start_keys=("sleep_start_time","start_time","bedtime_start"),
+                         end_keys=("sleep_end_time","end_time","bedtime_end")) -> dict:
     if not items:
         return {}
+
+    if date_field:
+        for it in items:
+            if it.get(date_field) == day.isoformat():
+                return it
 
     start_day = dt.datetime.combine(day, dt.time(0, 0, 0))
     end_day = start_day + dt.timedelta(days=1)
 
     def _end_ts(it: dict) -> Optional[dt.datetime]:
-        t = _parse_iso(_coalesce(it.get("sleep_end_time"), it.get("end_time"), it.get("bedtime_end")))
-        return t.replace(tzinfo=None) if t else None
+        for k in end_keys:
+            if it.get(k):
+                t = _parse_iso(it.get(k))
+                return t.replace(tzinfo=None) if t else None
+        return None
 
-    # 1) kraj u danu
     cand = [it for it in items if (et := _end_ts(it)) and (start_day <= et < end_day)]
     if cand:
-        cand.sort(key=lambda it: int(_coalesce(it.get("total_sleep_time"), it.get("actual_sleep_time"), 0)))
+        def _dur_s(it: dict) -> int:
+            for k in ("total_sleep_time", "actual_sleep_time", "duration"):
+                try:
+                    return int(it.get(k) or 0)
+                except Exception:
+                    pass
+            return 0
+        cand.sort(key=_dur_s)
         return cand[-1]
 
-    # 2) fallback: najveći preklop
-    def overlap_sec(it: dict) -> float:
-        s = _parse_iso(_coalesce(it.get("sleep_start_time"), it.get("start_time"), it.get("bedtime_start")))
-        e = _parse_iso(_coalesce(it.get("sleep_end_time"),   it.get("end_time"),   it.get("bedtime_end")))
+    # ako nema jasnog end_time, izaberi s najvećim preklopom u danu
+    def _overlap_sec(it: dict) -> float:
+        s = None; e = None
+        for k in start_keys:
+            if it.get(k):
+                s = _parse_iso(it.get(k)); break
+        for k in end_keys:
+            if it.get(k):
+                e = _parse_iso(it.get(k)); break
         if not s or not e:
             return -1.0
         s, e = s.replace(tzinfo=None), e.replace(tzinfo=None)
-        a = max(s, start_day)
-        b = min(e, end_day)
+        a = max(s, start_day); b = min(e, end_day)
         return max(0.0, (b - a).total_seconds())
 
-    items.sort(key=lambda it: (overlap_sec(it), int(_coalesce(it.get("total_sleep_time"), 0))))
-    return items[-1]
+    items.sort(key=_overlap_sec)
+    best = items[-1]
+    return best if _overlap_sec(best) > 0 else {}
+
+
+# ---------- Deep search (value + JSON path) ----------
+
+def _deep_find(obj: Any, keys: Tuple[str, ...]) -> Tuple[Optional[Any], Optional[str]]:
+    """Vrati prvu vrijednost za bilo koji ključ u `keys` i JSON path do nje."""
+    def visit(o: Any, path: str) -> Tuple[Optional[Any], Optional[str]]:
+        if isinstance(o, dict):
+            for k in keys:  # direktni pogodak
+                if k in o and o[k] is not None:
+                    return o[k], f"{path}.{k}" if path else k
+            for k, v in o.items():  # rekurzija
+                val, p = visit(v, f"{path}.{k}" if path else k)
+                if p is not None:
+                    return val, p
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                val, p = visit(v, f"{path}[{i}]")
+                if p is not None:
+                    return val, p
+        return None, None
+    return visit(obj, "")
+
+
+# --------------------------- HTTP helpers ---------------------------
+
+def _safe_json(r: httpx.Response) -> Any:
+    if r.status_code in (204, 205):
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def _get_json(client: httpx.Client, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    r = client.get(f"{BASE_URL}{path}", headers=_auth_headers(), params=params)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return _safe_json(r)
+
+
+# --------------------------- Data getters ---------------------------
+
+def get_sleep(day: dt.date) -> dict:
+    with httpx.Client(timeout=30) as client:
+        js = _get_json(client, f"/users/sleep/{day.isoformat()}")
+        if js is None:
+            js = _get_json(client, "/users/sleep",
+                           params={"start_date": (day - dt.timedelta(days=1)).isoformat(),
+                                   "end_date":   (day + dt.timedelta(days=1)).isoformat()})
+        items = _list_payload_items(js)
+        obj = _pick_record_for_day(items, day) if items else (js or {})
+        if DEBUG:
+            logger.info("polar_sleep_raw", date=str(day), raw=obj)
+        return obj or {}
+
+
+def get_recharge(day: dt.date) -> dict:
+    with httpx.Client(timeout=30) as client:
+        js = _get_json(client, "/users/nightly-recharge", params={"date": day.isoformat()})
+        if js is None:
+            js = _get_json(client, "/users/nightly-recharge",
+                           params={"start_date": (day - dt.timedelta(days=1)).isoformat(),
+                                   "end_date":   (day + dt.timedelta(days=1)).isoformat()})
+        items = _list_payload_items(js)           # <— sada vidi i 'recharges'
+        obj = _pick_record_for_day(items, day, date_field="date") if items else (js or {})
+        if DEBUG:
+            logger.info("polar_recharge_raw", date=str(day), raw=obj)
+        return obj or {}
+
+
+def get_daily_activity(day: dt.date) -> dict:
+    with httpx.Client(timeout=30) as client:
+        js = _get_json(client, "/users/daily-activity", params={"date": day.isoformat()})
+        if js is None:
+            js = _get_json(client, "/users/daily-activity",
+                           params={"start_date": day.isoformat(),
+                                   "end_date":   (day + dt.timedelta(days=1)).isoformat()})
+        if not _list_payload_items(js) and not isinstance(js, dict):
+            js = _get_json(client, f"/users/daily-activity/{day.isoformat()}")
+
+        items = _list_payload_items(js)
+        obj = None
+        if items:
+            obj = next((it for it in items if it.get("date") == day.isoformat()), items[-1])
+        elif isinstance(js, dict):
+            obj = js
+
+        if DEBUG:
+            logger.info("polar_activity_raw", date=str(day), raw=(obj or {}))
+        return obj or {}
 
 
 # --------------------------- Public API ---------------------------
 
-def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
-    """
-    Dohvati Polar sleep + daily activity + nightly recharge za dan
-    i mapiraj u UnifiedRow:
-      - bedtime / wake_time = stvarni početak/kraj sna
-      - sleep_duration_min = 'hh:mm' (Time asleep = total_sleep_time)
-      - steps / active_calories iz daily activity (ako postoji)
-      - rhr_bpm / hrv_ms + readiness_or_body_battery_score iz Nightly Recharge (ako postoji)
-    """
-    rows: list[list[Optional[str | float | int]]] = []
+def fetch_day(day: dt.date) -> List[List[Any]]:
+    # sirovi podaci
+    sleep = get_sleep(day)
+    recharge = get_recharge(day)
+    activity = get_daily_activity(day)
 
-    with httpx.Client(timeout=30) as client:
-        # --- SLEEP ---
-        status, js = _get_json(client, f"{BASE_URL}/users/sleep/{day.isoformat()}")
-        if status == 404:
-            status, js = _get_json(
-                client,
-                f"{BASE_URL}/users/sleep",
-                params={"start_date": (day - dt.timedelta(days=1)).isoformat(),
-                        "end_date":   (day + dt.timedelta(days=1)).isoformat()},
-            )
-            items: List[dict] = []
-            if isinstance(js, dict):
-                for key in ("sleep", "nights", "data", "items"):
-                    if isinstance(js.get(key), list):
-                        items = js[key]
-                        break
-            elif isinstance(js, list):
-                items = js
-            sleep_obj = _pick_record_for_day(items, day) if items else {}
-        else:
-            sleep_obj = js if isinstance(js, dict) else {}
+    date_str = day.isoformat()
+    source = "polar"
 
+    # --- SLEEP ---
+    bedtime = parse_iso_to_local_time(sleep.get("sleep_start_time")) if sleep else ""
+    wake_time = parse_iso_to_local_time(sleep.get("sleep_end_time")) if sleep else ""
+
+    sleep_duration = ""
+    if sleep:
+        try:
+            total_sec = int(sleep.get("light_sleep", 0)) + int(sleep.get("deep_sleep", 0)) + int(sleep.get("rem_sleep", 0))
+            sleep_duration = round(total_sec / 3600, 2)   # sati s 2 dec
+        except Exception:
+            pass
+
+    sleep_score = sleep.get("sleep_score", "") if sleep else ""
+
+    rhr_bpm = ""
+    if sleep and isinstance(sleep.get("heart_rate_samples"), dict) and sleep["heart_rate_samples"]:
+        try:
+            vals = [int(v) for v in sleep["heart_rate_samples"].values() if v is not None]
+            if vals:
+                rhr_bpm = min(vals)
+        except Exception:
+            pass
+    if rhr_bpm == "":
+        rhr_bpm = sleep.get("heart_rate_avg", "") if sleep else ""
+
+    # --- RECHARGE: HRV + Readiness ---
+    hrv_ms, hrv_path = _deep_find(recharge, ("heart_rate_variability_avg", "rmssd_ms", "rmssd", "hrv"))
+    readiness, readiness_path = _deep_find(recharge, ("ans_charge", "overall_score", "recharge_score", "score", "nightly_recharge_status"))
+
+    # normaliziraj tipove
+    def _to_int(x):
+        try:
+            return int(round(float(x)))
+        except Exception:
+            return x
+
+    hrv_ms = "" if hrv_ms is None else _to_int(hrv_ms)
+    readiness = "" if readiness is None else _to_int(readiness)
+
+    if DEBUG:
+        logger.info("polar_recharge_extracted",
+                    date=str(day), hrv_ms=hrv_ms, hrv_path=hrv_path,
+                    readiness=readiness, readiness_path=readiness_path)
+
+    # --- ACTIVITY: steps + active calories (nema fallbacka na total) ---
+    steps, steps_path = _deep_find(activity, ("steps", "daily_steps", "step_count"))
+    active_calories, acal_path = _deep_find(activity, ("active_calories", "active-calories", "caloriesActive"))
+
+    steps = "" if steps is None else _to_int(steps)
+    active_calories = "" if active_calories is None else _to_int(active_calories)
+
+    if DEBUG:
+        logger.info("polar_activity_extracted",
+                    date=str(day), steps=steps, steps_path=steps_path,
+                    active_calories=active_calories, active_calories_path=acal_path)
+
+    activity_score = ""
+    sc, sc_path = _deep_find(activity, ("activity_score",))
+    if sc is not None:
+        activity_score = _to_int(sc)
         if DEBUG:
-            logger.info("polar_sleep_raw", date=str(day), raw=sleep_obj)
+            logger.info("polar_activity_score_extracted", date=str(day), score=activity_score, path=sc_path)
 
-        start, end, dur_s, sleep_score = _extract_sleep_fields_polar(sleep_obj)
-        bedtime = _only_hms(start)
-        waketime = _only_hms(end)
-        sleep_duration_hhmm = _min_to_hhmm(seconds_to_minutes(dur_s))
+    # --- Workout polja (prazno) ---
+    row = [
+        date_str, source,
+        bedtime, wake_time, sleep_duration, sleep_score, rhr_bpm,
+        hrv_ms, readiness, steps, active_calories, activity_score,
+        "", "", "", "", "", "", "", "",
+        f"polar:{date_str}",
+    ]
 
-        # --- DAILY ACTIVITY (best-effort) ---
-        steps = None
-        active_calories = None
-        act_score = None
-        status, act = _get_json(client, f"{BASE_URL}/users/activity/{day.isoformat()}")
-        if isinstance(act, dict):
-            steps = _coalesce(act.get("steps"), act.get("daily_steps"))
-            active_calories = _coalesce(act.get("active_calories"), act.get("activity_calories"))
-            act_score = _coalesce(act.get("activity_score"), act.get("score"))
-
-        # --- NIGHTLY RECHARGE (best-effort) ---
-        rhr_bpm = None
-        hrv_ms = None
-        readiness = None
-        status, nr = _get_json(client, f"{BASE_URL}/users/nightly-recharge/{day.isoformat()}")
-        if isinstance(nr, dict):
-            # RHR
-            rhr_bpm = _coalesce(nr.get("resting_heart_rate"), nr.get("rhr"), nr.get("avg_rhr"))
-            # HRV (RMSSD u ms)
-            hrv_ms = _coalesce(nr.get("hrv"), nr.get("avg_rmssd"), nr.get("rmssd"))
-            # Readiness-like: različite varijante; pokušaj numeričke, fallback mapiranje statusa
-            readiness = _coalesce(nr.get("overall_score"), nr.get("score"))
-            if readiness is None:
-                status_txt = _coalesce(nr.get("recharge_status"), nr.get("status"))
-                if isinstance(status_txt, str):
-                    m = {"POOR": 30, "OK": 60, "GOOD": 90}
-                    readiness = m.get(status_txt.upper())
-
-        unified = UnifiedRow(
-            date=iso_date(day),
-            source="polar",
-            bedtime=bedtime,
-            wake_time=waketime,
-            sleep_duration_min=sleep_duration_hhmm,  # 'hh:mm'
-            sleep_score=sleep_score,
-            rhr_bpm=int(rhr_bpm) if rhr_bpm is not None else None,
-            hrv_ms=int(hrv_ms) if hrv_ms is not None else None,
-            readiness_or_body_battery_score=readiness,
-            steps=steps,
-            active_calories=active_calories,
-            activity_score=act_score,
-        )
-        rows.append(unified.as_row())
-
-    return rows
+    # ako je sve ključno prazno – ne vraćaj ništa
+    if all(v in ("", None) for v in row[2:12]):
+        return []
+    return [row]
