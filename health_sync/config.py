@@ -9,17 +9,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # General
     TZ: str = Field(default="Europe/Sarajevo")
+
     SPREADSHEET_ID: str = Field(
         default="1U6ozBmOkN_jRU44AHFlwISull1fYPLu0DCitNguvrIo",
         description="Google Spreadsheet ID",
     )
+
+    # Prihvati i GOOGLE_APPLICATION_CREDENTIALS kao alias
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = Field(
         default=None,
         description="Either JSON string of service account or path to JSON file",
+        validation_alias="GOOGLE_APPLICATION_CREDENTIALS",
     )
 
     # Oura
@@ -32,6 +40,7 @@ class Settings(BaseSettings):
     POLAR_CLIENT_ID: Optional[str] = None
     POLAR_CLIENT_SECRET: Optional[str] = None
     POLAR_REDIRECT_URI: Optional[str] = None
+    POLAR_ACCESS_TOKEN: Optional[str] = None  # 👈 DODANO: koristi ga sources/polar.py
 
     # Garmin (playwright)
     GARMIN_USERNAME: Optional[str] = None
@@ -53,5 +62,3 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
-
-
