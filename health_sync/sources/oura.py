@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple
 
 import httpx
 import structlog
@@ -14,9 +14,9 @@ from ..models import UnifiedRow
 from ..utils import (
     iso_date,
     seconds_to_minutes,
-    normalize_workout_type,
-    meters_to_km,
-    mps_to_speed_and_pace,
+    normalize_workout_type,  # noqa: F401
+    meters_to_km,            # noqa: F401
+    mps_to_speed_and_pace,   # noqa: F401
 )
 from ..config import get_settings
 
@@ -94,8 +94,9 @@ def _only_hms(ts: Optional[str]) -> Optional[str]:
     return None
 
 
-def _window_18(day: dt.date, tzinfo: Optional[dt.tzinfo]) -> tuple[dt.datetime, dt.datetime]:
-    start = dt.datetime.combine(day, dt.time(18, 0)).replace(tzinfo=tzinfo)
+def _window_day(day: dt.date, tzinfo: Optional[dt.tzinfo]) -> tuple[dt.datetime, dt.datetime]:
+    """Kalendarski dan: [00:00, +1d 00:00)."""
+    start = dt.datetime.combine(day, dt.time(0, 0)).replace(tzinfo=tzinfo)
     end = start + dt.timedelta(days=1)
     return start, end
 
@@ -107,11 +108,12 @@ def _overlap_seconds(a_start, a_end, b_start, b_end):
 
 
 def _pick_sleep_ending_in_day(periods, day):
-    """Period kojem bedtime_end pada unutar [18:00, +1d 18:00)."""
+    """Period kojem *bedtime_end* pada unutar kalendarskog dana [00:00, +1d 00:00)."""
     if not periods:
         return {}
+    # koristimo tz iz prvog perioda
     ref = _parse_iso(periods[0].get("bedtime_start")) or dt.datetime.combine(day, dt.time.min)
-    w_start, w_end = _window_18(day, ref.tzinfo)
+    w_start, w_end = _window_day(day, ref.tzinfo)
     candidates = []
     for p in periods:
         e = _parse_iso(p.get("bedtime_end"))
@@ -128,11 +130,11 @@ def _pick_sleep_ending_in_day(periods, day):
 
 
 def _pick_sleep_for_day(periods, day):
-    """Fallback: najveći preklop s 18–18 prozorom."""
+    """Fallback: najveći preklop s kalendarskim danom [00:00, +1d 00:00)."""
     if not periods:
         return {}
     ref = _parse_iso(periods[0].get("bedtime_start")) or dt.datetime.combine(day, dt.time.min)
-    w_start, w_end = _window_18(day, ref.tzinfo)
+    w_start, w_end = _window_day(day, ref.tzinfo)
     best = None
     best_key = (-1.0, 0)
     for p in periods:
@@ -148,13 +150,62 @@ def _pick_sleep_for_day(periods, day):
     return best or {}
 
 
+def _coalesce(*vals):
+    """Vrati prvi ne-None vrijednost."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _min_to_hhmm(m: Optional[int]) -> Optional[str]:
+    """Pretvori minute u 'hh:mm' string."""
+    if m is None:
+        return None
+    h = int(m) // 60
+    mm = int(m) % 60
+    return f"{h:02d}:{mm:02d}"
+
+
+def _extract_sleep_fields(sleep_period: dict, sleep_daily: dict) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Vraća (asleep_start, asleep_end, duration_sec)
+    - start/end = stvarni početak/kraj sna (što vidiš u Oura appu)
+    - duration = 'Time asleep' (isključuje awake segmente)
+    Fallbackovi:
+      start  -> period.start -> period.bedtime_start -> daily.bedtime_start
+      end    -> period.end   -> period.bedtime_end   -> daily.bedtime_end
+      dur    -> period.total_sleep_duration -> daily.total_sleep_duration -> period.duration
+    """
+    asleep_start = _coalesce(
+        sleep_period.get("start"),
+        sleep_period.get("bedtime_start"),
+        sleep_daily.get("bedtime_start"),
+    )
+    asleep_end = _coalesce(
+        sleep_period.get("end"),
+        sleep_period.get("bedtime_end"),
+        sleep_daily.get("bedtime_end"),
+    )
+    duration_sec = _coalesce(
+        sleep_period.get("total_sleep_duration"),
+        sleep_daily.get("total_sleep_duration"),
+        sleep_period.get("duration"),
+    )
+    try:
+        duration_sec = int(duration_sec) if duration_sec is not None else None
+    except Exception:
+        pass
+    return asleep_start, asleep_end, duration_sec
+
+
 # --------------------------- Glavna funkcija ---------------------------
 
 def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
     """
-    “Dan sna” definiran 18:00 → 18:00.
-    Ako sleep završava prije 18:00, vežemo ga uz prethodni kalendarski dan.
+    “Dan sna” = kalendarski dan (00:00–24:00).
     """
+    # širi upit za slučaj da period prelazi granice dana
     periods_start = (day - dt.timedelta(days=1)).isoformat()
     periods_end = (day + dt.timedelta(days=1)).isoformat()
     headers = _auth_headers()
@@ -162,49 +213,61 @@ def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
 
     with httpx.Client(timeout=30) as client:
         # Sleep
-        js = client.get(f"{BASE_URL}/usercollection/sleep",
-                        params={"start_date": periods_start, "end_date": periods_end},
-                        headers=headers).json()
+        js = client.get(
+            f"{BASE_URL}/usercollection/sleep",
+            params={"start_date": periods_start, "end_date": periods_end},
+            headers=headers,
+        ).json()
         periods = js.get("data", []) or []
         non_naps = [p for p in periods if p.get("type") != "nap"] or periods
         sleep_period = _pick_sleep_ending_in_day(non_naps, day) or _pick_sleep_for_day(non_naps, day)
 
         if DEBUG:
-            logger.info("sleep_choice",
-                        date=str(day),
-                        bed_start=sleep_period.get("bedtime_start"),
-                        bed_end=sleep_period.get("bedtime_end"),
-                        d_type=sleep_period.get("type"),
-                        duration=sleep_period.get("duration"),
-                        total_periods=len(periods))
+            logger.info(
+                "sleep_choice",
+                date=str(day),
+                bed_start=sleep_period.get("bedtime_start"),
+                bed_end=sleep_period.get("bedtime_end"),
+                start=sleep_period.get("start"),
+                end=sleep_period.get("end"),
+                d_type=sleep_period.get("type"),
+                time_asleep=sleep_period.get("total_sleep_duration"),
+                in_bed_duration=sleep_period.get("duration"),
+                total_periods=len(periods),
+            )
 
         # ostali endpointi
         def get_first(endpoint):
-            js = client.get(f"{BASE_URL}/usercollection/{endpoint}",
-                            params={"start_date": day.isoformat(), "end_date": (day + dt.timedelta(days=1)).isoformat()},
-                            headers=headers).json()
+            js = client.get(
+                f"{BASE_URL}/usercollection/{endpoint}",
+                params={"start_date": day.isoformat(), "end_date": (day + dt.timedelta(days=1)).isoformat()},
+                headers=headers,
+            ).json()
             return js.get("data", [{}])[0] if js.get("data") else {}
 
         sleep_daily = get_first("daily_sleep")
         readiness = get_first("daily_readiness")
         activity = get_first("daily_activity")
 
-        # ako wake_time < 18:00, vežemo ga na prethodni dan
-        bed_end = _parse_iso(sleep_period.get("bedtime_end"))
-        adjusted_date = day
-        if bed_end and bed_end.hour < 18:
-            adjusted_date = day - dt.timedelta(days=1)
+        # stvarni start/end + 'Time asleep'
+        asleep_start, asleep_end, duration_sec = _extract_sleep_fields(sleep_period, sleep_daily)
 
-        duration_sec = sleep_period.get("duration") or sleep_daily.get("total_sleep_duration")
+        # zapisujemo na traženi kalendarski dan (bez 18→18 pravila)
+        adjusted_date = day
+
         rhr = sleep_period.get("lowest_heart_rate") or sleep_daily.get("average_bpm")
         hrv = sleep_daily.get("average_hrv") or sleep_period.get("average_hrv")
+
+        # minutes -> 'hh:mm'
+        duration_hhmm = _min_to_hhmm(seconds_to_minutes(duration_sec))
 
         unified = UnifiedRow(
             date=iso_date(adjusted_date),
             source="oura",
-            bedtime=_only_hms(sleep_period.get("bedtime_start")),
-            wake_time=_only_hms(sleep_period.get("bedtime_end")),
-            sleep_duration_min=seconds_to_minutes(duration_sec),
+            bedtime=_only_hms(asleep_start),   # npr. 00:58
+            wake_time=_only_hms(asleep_end),   # npr. 08:38
+            # Iako se polje zove *_min, sada šaljemo 'hh:mm' string kako bi sheet prikazao željeni format
+            sleep_duration_min=duration_hhmm,
             sleep_score=sleep_daily.get("score"),
             rhr_bpm=int(rhr) if rhr else None,
             hrv_ms=int(hrv) if hrv else None,
