@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     ROLLA_ONE_PASS: Optional[str] = None
     ROLLA_ONE_STATE: str = Field(default="./state/rollaone.json")
 
+    # DODAJ OVO:
+POLAR_USER_ID: Optional[str] = None
+
+# (za Flow fallback – opcionalno, ali korisno za steps)
+POLAR_FLOW_SESSION: Optional[str] = None
+POLAR_PLAY_SESSION_FLOW: Optional[str] = None
+
 
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
