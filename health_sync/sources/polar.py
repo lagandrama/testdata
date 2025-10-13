@@ -249,7 +249,40 @@ def _extract_recharge_fields(obj: dict) -> tuple[Optional[int], Optional[int], O
     return hrv, rhr, readiness
 
 
-# --------------------------- Daily activity preko AccessLink transakcija ---------------------------
+# --------------------------- Activity: novi v3 endpoint ---------------------------
+
+def _fetch_activity_v3(client: httpx.Client, day: dt.date) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Primarno dohvaćanje (steps, active_calories) preko novog v3 endpointa:
+      GET /users/activities/{date}?steps=true
+    """
+    try:
+        js = _get_json(client, f"/users/activities/{day.isoformat()}", params={"steps": "true"})
+    except Exception:
+        js = None
+
+    if DEBUG:
+        logger.info("polar_activity_v3_raw", date=str(day), raw=js)
+
+    if not js:
+        return None, None
+
+    # Endpoint može vratiti dict ili list (ovisno o verziji/rangu)
+    item: dict | None = None
+    if isinstance(js, dict):
+        item = js
+    else:
+        items = _list_payload_items(js)
+        item = next((it for it in items if it.get("date") == day.isoformat()), items[-1] if items else None)
+
+    if not item:
+        return None, None
+
+    steps, kcals, _ = _extract_activity_fields(item)
+    return steps, kcals
+
+
+# --------------------------- Activity: fallback preko transakcija ---------------------------
 
 def _fetch_activity_via_transactions(client: httpx.Client, day: dt.date) -> Tuple[Optional[int], Optional[int]]:
     """
@@ -257,7 +290,7 @@ def _fetch_activity_via_transactions(client: httpx.Client, day: dt.date) -> Tupl
     """
     uid = _user_id()
     r = _post_empty(client, f"/users/{uid}/activity-transactions")
-    if r.status_code not in (200, 201):
+    if r.status_code not in (200, 201, 204):
         if DEBUG:
             logger.info("polar_activity_tx_create_failed", status=r.status_code, body=_safe_json(r))
         return None, None
@@ -325,12 +358,12 @@ def _fetch_activity_via_transactions(client: httpx.Client, day: dt.date) -> Tupl
     return steps, active
 
 
-# --------------------------- Fallback: Flow loadFour (stepCount) ---------------------------
+# --------------------------- Fallback: Flow loadFour (samo steps) ---------------------------
 
 def _fetch_steps_via_flow(day: dt.date) -> Optional[int]:
     """
     Fallback na Flow privatni API:
-    GET /api/activity-timeline/loadFour?day=YYYY-MM-DD&maxSampleCount=200
+      GET /api/activity-timeline/loadFour?day=YYYY-MM-DD&maxSampleCount=200
     Očekuje cookie sesiju:
       - POLAR_FLOW_SESSION (FLOW_SESSION)
       - (opcionalno) POLAR_PLAY_SESSION_FLOW (PLAY_SESSION_FLOW)
@@ -343,7 +376,6 @@ def _fetch_steps_via_flow(day: dt.date) -> Optional[int]:
     cookies = {"FLOW_SESSION": sess}
     if play_sess:
         cookies["PLAY_SESSION_FLOW"] = play_sess
-    # lagani QoL cookie – nije obavezno
     cookies.setdefault("timezone", "120")
 
     url = f"{FLOW_BASE}/api/activity-timeline/loadFour"
@@ -387,7 +419,8 @@ def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
     Dohvati Polar podatke za zadani dan i mapiraj u UnifiedRow.
     - Sleep -> /users/sleep
     - Nightly Recharge -> /users/nightly-recharge
-    - Steps/Active calories -> activity-transactions (AccessLink), pa Flow fallback za korake
+    - Steps/Active calories -> /users/activities/{date}?steps=true (primarno),
+      pa activity-transactions, pa Flow fallback (samo steps)
     """
     with httpx.Client(timeout=30) as client:
         # ---------- SLEEP ----------
@@ -411,8 +444,7 @@ def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
 
         bedtime  = _only_hms(start)
         waketime = _only_hms(end)
-        # PRIKAZ: hh:mm
-        dur_hhmm = _min_to_hhmm(seconds_to_minutes(dur_s))
+        dur_hhmm = _min_to_hhmm(seconds_to_minutes(dur_s))  # HH:MM
 
         steps: Optional[int] = None
         active_cals: Optional[int] = None
@@ -447,18 +479,30 @@ def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
                 if rhr is None:     rhr    = rhr_candidate
                 if readiness is None: readiness = readiness_candidate
 
-        # ---------- ACTIVITY: koraci + aktivne kalorije preko transakcija ----------
+        # ---------- ACTIVITY: primarno novi v3 endpoint ----------
         try:
-            s, kcals = _fetch_activity_via_transactions(client, day)
+            s, kcals = _fetch_activity_v3(client, day)
             if s is not None:
                 steps = s
             if kcals is not None:
-                active_cals = kcals  # samo 'active' ako postoji – ne zapisujemo total
+                active_cals = kcals  # samo 'active' – ne koristimo total
         except Exception as e:
             if DEBUG:
-                logger.info("polar_activity_tx_error", err=str(e))
+                logger.info("polar_activity_v3_error", err=str(e))
 
-    # Fallback: Flow (samo koraci)
+        # ---------- Fallback: transakcije ----------
+        if steps is None and active_cals is None:
+            try:
+                s, kcals = _fetch_activity_via_transactions(client, day)
+                if s is not None:
+                    steps = s
+                if kcals is not None:
+                    active_cals = kcals
+            except Exception as e:
+                if DEBUG:
+                    logger.info("polar_activity_tx_error", err=str(e))
+
+    # ---------- Fallback: Flow (samo koraci) ----------
     if steps is None:
         try:
             steps = _fetch_steps_via_flow(day)
@@ -476,7 +520,7 @@ def fetch_day(day: dt.date) -> list[list[Optional[str | float | int]]]:
         source="polar",
         bedtime=bedtime,
         wake_time=waketime,
-        sleep_duration_min=dur_hhmm,   # hh:mm
+        sleep_duration_min=dur_hhmm,   # HH:MM
         sleep_score=score,
         rhr_bpm=rhr,
         hrv_ms=hrv_ms,
