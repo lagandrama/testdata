@@ -9,6 +9,9 @@ ENV POETRY_HOME=/opt/poetry \
 RUN pip install --no-cache-dir poetry==${POETRY_VERSION}
 WORKDIR /app
 
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY pyproject.toml README.md ./
 RUN poetry config virtualenvs.create false
 RUN poetry install --no-interaction --no-ansi --only main
