@@ -8,3 +8,8 @@ pydantic>=2.4
 pydantic-settings>=2.0
 python-dotenv
 pytz>=2024.1
+garminconnect>=0.2.0
+garth>=0.4.0
+gspread>=6.0.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.2.0
