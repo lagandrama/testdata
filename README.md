@@ -28,8 +28,8 @@ In order: date, source, bedtime, wake_time, sleep_duration_min, sleep_score, rhr
 
 ## Sources
 - Oura v2: PAT supported, OAuth2 planned. Sleep/Readiness/Activity implemented, workouts basic.
-- Polar: skeleton.
-- Garmin: skeleton with Playwright fallback planned.
+- Polar: implemented basic sleep/steps/active calories via AccessLink, Flow fallback for steps.
+- Garmin: daily sync implemented (sleep, steps, active calories, body battery if available). Use `scripts/push_garmin_to_sheet.py` or `health-sync fetch --sources garmin`.
 - Apple Health: XML importer + FastAPI webhook planned.
 - ROSS / Rolla One: Playwright scrapers planned.
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dotenv import load_dotenv; load_dotenv()
+from dotenv import load_dotenv, find_dotenv; load_dotenv(find_dotenv(usecwd=True), override=True)
 
 from pathlib import Path
 from typing import Optional
@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     GARMIN_USERNAME: Optional[str] = None
     GARMIN_PASSWORD: Optional[str] = None
     GARMIN_STORAGE_STATE: str = Field(default="./state/garmin.json")
+    GARMIN_LOGIN_RETRIES: int = Field(default=5, description="Number of Garmin login attempts with backoff")
+    GARMIN_LOGIN_BACKOFF_MAX_SECONDS: int = Field(default=300, description="Max seconds to backoff between login attempts")
 
     # Rolla ROSS
     ROLLA_ROSS_URL: Optional[str] = None
@@ -59,12 +61,11 @@ class Settings(BaseSettings):
     ROLLA_ONE_PASS: Optional[str] = None
     ROLLA_ONE_STATE: str = Field(default="./state/rollaone.json")
 
-    # DODAJ OVO:
-POLAR_USER_ID: Optional[str] = None
-
-# (za Flow fallback – opcionalno, ali korisno za steps)
-POLAR_FLOW_SESSION: Optional[str] = None
-POLAR_PLAY_SESSION_FLOW: Optional[str] = None
+    # Polar user/session extras
+    POLAR_USER_ID: Optional[str] = None
+    # (Flow fallback – optional, used for steps when API lacks data)
+    POLAR_FLOW_SESSION: Optional[str] = None
+    POLAR_PLAY_SESSION_FLOW: Optional[str] = None
 
 
 def get_settings() -> Settings:

@@ -1,30 +1,20 @@
-# sources/garmin.py
 from __future__ import annotations
 
 import datetime as dt
-import json
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, List
+import json
+import pathlib
+import time
+import random
 
 import structlog
-from playwright.sync_api import sync_playwright
 
 from ..models import UnifiedRow
 from ..utils import iso_date, seconds_to_minutes
-from ..config import get_settings
 
 logger = structlog.get_logger()
 
-BASE_MODERN = "https://connect.garmin.com/modern"
-BASE_API    = "https://connectapi.garmin.com"
-DEBUG = os.getenv("GARMIN_DEBUG") == "1"
-
-# ------------- helpers -------------
-def _min_to_hhmm(m: Optional[int]) -> Optional[str]:
-    if m is None: return None
-    m = int(m); h, mm = divmod(m, 60)
-    return f"{h:02d}:{mm:02d}"
 
 def _coalesce(*vals):
     for v in vals:
@@ -32,277 +22,294 @@ def _coalesce(*vals):
             return v
     return None
 
-def _parse_ms(ms: Optional[int]) -> Optional[dt.datetime]:
-    if ms is None: return None
+
+# --- capture/cache mode config ---
+GARMIN_MODE = (os.getenv("GARMIN_MODE") or "online").lower()  # online | capture
+GARMIN_CACHE_DIR = pathlib.Path(os.getenv("GARMIN_CACHE_DIR") or "./data/garmin_cache")
+
+
+def _cache_path(kind: str, day: dt.date) -> pathlib.Path:
+    GARMIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return GARMIN_CACHE_DIR / f"{kind}-{day.isoformat()}.json"
+
+
+def _read_cache(kind: str, day: dt.date) -> dict:
+    p = _cache_path(kind, day)
+    if not p.exists():
+        return {}
     try:
-        return dt.datetime.utcfromtimestamp(int(ms) / 1000.0)
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _min_to_hhmm(m: Optional[int]) -> Optional[str]:
+    if m is None:
+        return None
+    m = int(m)
+    h, mm = divmod(m, 60)
+    return f"{h:02d}:{mm:02d}"
+
+
+def _only_hms(ts: Optional[str]) -> Optional[str]:
+    if not ts:
+        return None
+    try:
+        # accept formats like HH:MM:SS or ISO and return HH:MM:SS
+        if "T" in ts:
+            from datetime import datetime
+            t = datetime.fromisoformat(ts)
+            return t.strftime("%H:%M:%S")
+        parts = ts.split(":")
+        if len(parts) >= 2:
+            hh = int(parts[0]); mm = int(parts[1]); ss = int(parts[2]) if len(parts) > 2 else 0
+            return f"{hh:02d}:{mm:02d}:{ss:02d}"
     except Exception:
         return None
+    return None
 
-def _only_hms_from_ms(ms: Optional[int]) -> Optional[str]:
-    t = _parse_ms(ms)
-    return t.strftime("%H:%M:%S") if t else None
 
-def _state_path() -> Path:
-    return Path(get_settings().GARMIN_STORAGE_STATE or "./state/garmin.json")
-
-def _load_state() -> dict:
-    p = _state_path()
-    if not p.exists():
-        raise RuntimeError(f"GARMIN_STORAGE_STATE not found: {p}")
-    return json.loads(p.read_text(encoding="utf-8"))
-
-def _token_and_fgp() -> tuple[Optional[str], Optional[str]]:
-    js = _load_state()
-    token = None
-    fgp = None
-    for origin in js.get("origins", []):
-        for kv in origin.get("localStorage", []):
-            if kv.get("name") == "token":
-                try:
-                    token = json.loads(kv["value"]).get("access_token")
-                except Exception:
-                    pass
-    for ck in js.get("cookies", []):
-        if ck.get("name") == "JWT_FGP":
-            fgp = ck.get("value")
-            break
-    return token, fgp
-
-def _headers() -> Dict[str, str]:
-    token, fgp = _token_and_fgp()
-    h = {
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://connect.garmin.com",
-        "Referer": f"{BASE_MODERN}/",
-        "User-Agent": "Mozilla/5.0",
-        "X-Requested-With": "XMLHttpRequest",
-        "x-app-id": "com.garmin.connect.web",
-        "NK": "NT",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-        h["di-auth"] = f"Bearer {token}"
-    if fgp:
-        h["DI-DEVICE-ID"] = fgp
-        h["DI-APP-PLATFORM"] = "web"
-    return h
-
-def _urls(path: str) -> List[str]:
-    # path like "/proxy/wellness-service/wellness/dailySummary"
-    # try modern + connectapi variant
-    api_path = path.removeprefix("/proxy")
-    return [f"{BASE_MODERN}{path}", f"{BASE_API}{api_path}"]
-
-def _fetch_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """
-    One request context (Playwright) and try modern + connectapi.
-    """
-    st = str(_state_path())
-    with sync_playwright() as pw:
-        ctx = pw.request.new_context(storage_state=st, extra_http_headers=_headers())
-        for url in _urls(path):
-            resp = ctx.get(url, params=params)
-            ok = resp.ok
-            txt = ""
+def _extract_number(val) -> Optional[int]:
+    """Return an int if possible. Handles dict forms like {value: 79, qualifierKey: "FAIR"}."""
+    try:
+        if val is None:
+            return None
+        # dict with common numeric carrier keys
+        if isinstance(val, dict):
+            for k in ("value", "score", "overall", "overallScore", "numeric", "number"):
+                if k in val:
+                    return _extract_number(val[k])
+            return None
+        # list/tuple – pick first numeric
+        if isinstance(val, (list, tuple)):
+            for x in val:
+                n = _extract_number(x)
+                if n is not None:
+                    return n
+            return None
+        # numbers
+        if isinstance(val, (int, float)):
             try:
-                txt = resp.text()[:160]
+                return int(val)
+            except Exception:
+                return None
+        # strings
+        if isinstance(val, str):
+            s = val.strip()
+            # try int
+            if s.isdigit():
+                return int(s)
+            # try float
+            try:
+                f = float(s)
+                return int(f)
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def _login_client():
+    """
+    Try garminconnect (new) with either garth session or username/password.
+    We keep it simple and rely on env GARMIN_USERNAME/GARMIN_PASSWORD if present.
+    """
+    try:
+        from garminconnect import Garmin
+    except Exception as e:
+        raise RuntimeError(f"garminconnect is not installed or failed to import: {e}")
+
+    user = os.getenv("GARMIN_USERNAME")
+    pwd = os.getenv("GARMIN_PASSWORD")
+    if not user or not pwd:
+        raise RuntimeError("GARMIN_USERNAME/GARMIN_PASSWORD not set in environment")
+
+    client = Garmin(user, pwd)
+
+    def _do_login():
+        client.login()
+
+    _retry_with_backoff(_do_login, label="garmin_login")
+    return client
+
+
+def _fetch_daily(client, day: dt.date) -> dict:
+    def _call():
+        try:
+            return client.get_user_summary(day.isoformat())  # type: ignore[attr-defined]
+        except Exception:
+            return client.get_stats(day.isoformat())  # fallback
+
+    try:
+        return _retry_with_backoff(_call, label="garmin_daily") or {}
+    except Exception:
+        return {}
+
+
+def _fetch_sleep(client, day: dt.date) -> dict:
+    def _call():
+        try:
+            return client.get_sleep_data(day.isoformat())  # type: ignore[attr-defined]
+        except Exception:
+            return client.get_sleep(day.isoformat())
+
+    try:
+        return _retry_with_backoff(_call, label="garmin_sleep") or {}
+    except Exception:
+        return {}
+
+
+def _is_rate_limited_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "429" in msg or "rate limit" in msg or "1015" in msg:
+        return True
+    # Some http-like exceptions expose status
+    code = getattr(err, "status_code", None) or getattr(err, "code", None)
+    try:
+        if code and int(code) in (429, 1015):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _retry_with_backoff(fn, label: str, *, max_attempts: int = 6, base_delay: float = 1.0, max_delay: float = 60.0):
+    """
+    Exponential backoff with jitter. Retries on any exception, but logs when rate limited.
+    Delays: ~1s,2s,4s,8s,16s,32s (capped), with +/- jitter.
+    """
+    attempt = 0
+    last_err: Exception | None = None
+    while attempt < max_attempts:
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            attempt += 1
+            is_rl = _is_rate_limited_error(e)
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            jitter = random.uniform(0.25, 1.25)
+            sleep_s = delay * jitter
+            logger.warning(
+                "garmin_retry",
+                extra={
+                    "label": label,
+                    "attempt": attempt,
+                    "max": max_attempts,
+                    "rate_limited": is_rl,
+                    "sleep_sec": round(sleep_s, 2),
+                    "error": str(e),
+                },
+            )
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise last_err
+    return None
+
+
+def fetch_day(day: dt.date) -> List[List[Optional[str | float | int]]]:
+    """
+    Fetch Garmin daily metrics for a given calendar day and map to UnifiedRow.
+    We aim for: bedtime, wake_time, sleep_duration_min (HH:MM), sleep_score, rhr_bpm (lowest),
+    hrv_ms (not available -> None), readiness_or_body_battery_score (body battery),
+    steps, active_calories.
+    """
+    if GARMIN_MODE == "capture":
+        daily = _read_cache("daily", day)
+        sleep = _read_cache("sleep", day)
+        if not daily and not sleep:
+            raise RuntimeError(
+                "Capture files not found. Run: python -m health_sync.playwright.garmin_capture"
+            )
+    else:
+        client = _login_client()
+        try:
+            daily = _fetch_daily(client, day) or {}
+            sleep = _fetch_sleep(client, day) or {}
+        finally:
+            try:
+                client.logout()
             except Exception:
                 pass
-            if DEBUG:
-                logger.info("garmin_req", url=url, status=resp.status, ok=ok, peek=txt)
-            if not ok:
-                continue
-            try:
-                js = resp.json()
-            except Exception:
-                js = None
-            # treat {} / [] as empty
-            if isinstance(js, dict) and not js:
-                continue
-            if isinstance(js, list) and not js:
-                continue
-            if js is not None:
-                return js
-        return None
 
-# ------------- extractors -------------
-def _extract_sleep(js: Any) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[int], Optional[int]]:
-    if not isinstance(js, dict):
-        return None, None, None, None, None
+    # Parse sleep
+    # garminconnect sleep structure varies; try common fields
+    bedtime = None
+    waketime = None
+    duration_min = None
+    sleep_score = None
+    lowest_hr = None
 
-    start_ms = _coalesce(js.get("sleepStartTimestampGMT"),
-                         js.get("sleepStartTimestampUTC"),
-                         js.get("overallSleepStartTimestamp"))
-    end_ms   = _coalesce(js.get("sleepEndTimestampGMT"),
-                         js.get("sleepEndTimestampUTC"),
-                         js.get("overallSleepEndTimestamp"))
-    dur_sec  = _coalesce(js.get("durationInSeconds"),
-                         js.get("sleepTimeSeconds"),
-                         js.get("sleepingSeconds"))
-    try: dur_min = int(seconds_to_minutes(int(dur_sec))) if dur_sec is not None else None
-    except Exception: dur_min = None
+    try:
+        if isinstance(sleep, dict):
+            sw = sleep.get("sleepWindow") or sleep.get("dailySleepDTO") or sleep.get("sleepSummary") or {}
+            # common variants
+            bedtime = _coalesce(sw.get("sleepStartTimestampLocal"), sw.get("startTimeGMT"), sw.get("sleepStartTime"))
+            waketime = _coalesce(sw.get("sleepEndTimestampLocal"), sw.get("endTimeGMT"), sw.get("sleepEndTime"))
+            # duration sec or min depending on field
+            dur_sec = _coalesce(sw.get("sleepTimeSeconds"), sw.get("sleepDuration"), sw.get("duration"))
+            if dur_sec is not None:
+                try:
+                    dur_sec = int(dur_sec)
+                except Exception:
+                    dur_sec = None
+            if dur_sec is not None:
+                duration_min = seconds_to_minutes(dur_sec)
+            raw_score = _coalesce(sw.get("sleepScores", {}).get("overall"), sw.get("overallScore"), sw.get("sleepScore"))
+            sleep_score = _extract_number(raw_score)
+            lowest_hr = _coalesce(sw.get("lowestHeartRate"), sw.get("minHeartRate"))
+    except Exception:
+        pass
 
-    score = _coalesce(js.get("overallSleepScore"), js.get("sleepScore"))
-    try: score = int(score) if score is not None else None
-    except Exception: score = None
+    # Daily activity
+    steps = None
+    active_cal = None
+    readiness_or_bb = None
+    try:
+        if isinstance(daily, dict):
+            steps = _coalesce(daily.get("steps"), daily.get("totalSteps"))
+            active_cal = _coalesce(daily.get("activeKilocalories"), daily.get("activeCalories"))
+            # Body Battery score may be present in a separate object; attempt common keys
+            raw_bb = _coalesce(
+                daily.get("bodyBatteryOverallValue"),
+                daily.get("bodyBatteryMax"),
+                daily.get("bodyBatteryOverall"),
+            )
+            readiness_or_bb = _extract_number(raw_bb)
+    except Exception:
+        pass
 
-    lowest = _coalesce(js.get("lowestHeartRate"),
-                       js.get("lowestRespirationHeartRate"),
-                       js.get("minHeartRate"))
-    try: lowest = int(lowest) if lowest is not None else None
-    except Exception: lowest = None
-
-    return (_only_hms_from_ms(start_ms),
-            _only_hms_from_ms(end_ms),
-            dur_min, score, lowest)
-
-def _extract_daily_summary(js: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    if not isinstance(js, dict):
-        return None, None, None
-    steps = _coalesce(js.get("steps"), js.get("totalSteps"))
-    kcals = _coalesce(js.get("activeKilocalories"), js.get("activeCalories"))
-    rhr   = _coalesce(js.get("restingHeartRate"), js.get("minHeartRate"))
+    # Normalize types
     try: steps = int(steps) if steps is not None else None
     except Exception: steps = None
-    try: kcals = int(kcals) if kcals is not None else None
-    except Exception: kcals = None
-    try: rhr   = int(rhr)   if rhr   is not None else None
-    except Exception: rhr = None
-    return steps, kcals, rhr
+    try: active_cal = int(active_cal) if active_cal is not None else None
+    except Exception: active_cal = None
+    try: lowest_hr = int(lowest_hr) if lowest_hr is not None else None
+    except Exception: lowest_hr = None
+    # sleep_score and body battery already normalized via _extract_number
 
-def _extract_usersummary(js: Any) -> Dict[str, Any]:
-    if not isinstance(js, dict):
-        return {}
-    out: Dict[str, Any] = {}
-    out["steps"] = _coalesce(js.get("steps"), js.get("totalSteps"))
-    out["activeKilocalories"] = _coalesce(js.get("activeKilocalories"), js.get("activeCalories"))
-    out["restingHeartRate"] = _coalesce(js.get("restingHeartRate"), js.get("minHeartRate"))
-    out["sleepStartTimestampGMT"] = _coalesce(js.get("sleepStartTimestampGMT"), js.get("sleepStartTimestampUTC"))
-    out["sleepEndTimestampGMT"]   = _coalesce(js.get("sleepEndTimestampGMT"),   js.get("sleepEndTimestampUTC"))
-    out["sleepTimeSeconds"]       = _coalesce(js.get("sleepTimeSeconds"),       js.get("sleepingSeconds"))
-    out["sleepScore"] = js.get("sleepScore")
-    return out
+    hhmm = _min_to_hhmm(duration_min)
 
-def _extract_hrv(js: Any) -> Optional[int]:
-    if not isinstance(js, dict):
-        return None
-    cand = _coalesce(js.get("avgRmssd"), js.get("rmssd"), js.get("averageRmssd"))
-    try:
-        return int(round(float(cand))) if cand is not None else None
-    except Exception:
-        return None
-
-def _extract_body_battery(js: Any) -> Optional[int]:
-    if not isinstance(js, dict):
-        return None
-    val = _coalesce(js.get("mostRecentValue"),
-                    js.get("mostRecent"),
-                    js.get("bodyBatteryMostRecent"),
-                    js.get("bodyBatteryMax"))
-    try:
-        return int(val) if val is not None else None
-    except Exception:
-        return None
-
-# ------------- public -------------
-def fetch_day(day: dt.date) -> List[List[Optional[str | float | int]]]:
-    bedtime = waketime = None
-    sleep_score = None
-    lowest_hr_sleep = None
-    sleep_dur_hhmm = None
-    steps = None
-    active_cals = None
-    rhr = None
-    hrv_ms = None
-    readiness_or_bb = None
-
-    # Sleep
-    sleep_js = (_fetch_json("/proxy/wellness-service/wellness/dailySleepData", {"date": day.isoformat()})
-                or _fetch_json(f"/proxy/wellness-service/wellness/dailySleepData/{day.isoformat()}"))
-    if DEBUG: logger.info("garmin_sleep_raw", date=str(day), has=bool(sleep_js))
-    if sleep_js:
-        bt, wt, dur_min, sc, lowest = _extract_sleep(sleep_js)
-        bedtime, waketime = bt, wt
-        sleep_score, lowest_hr_sleep = sc, lowest
-        sleep_dur_hhmm = _min_to_hhmm(dur_min)
-
-    # Daily summary
-    daily_js = (_fetch_json("/proxy/wellness-service/wellness/dailySummary", {"date": day.isoformat()})
-                or _fetch_json(f"/proxy/wellness-service/wellness/dailySummary/{day.isoformat()}"))
-    if DEBUG: logger.info("garmin_daily_raw", date=str(day), has=bool(daily_js))
-    if daily_js:
-        s, ac, r = _extract_daily_summary(daily_js)
-        steps = steps or s
-        active_cals = active_cals or ac
-        rhr = rhr or r
-        if lowest_hr_sleep is None:
-            lowest_hr_sleep = _coalesce(daily_js.get("minHeartRate"), daily_js.get("lowestHeartRate"))
-
-    # Fallback: usersummary-service
-    if steps is None or (bedtime is None and waketime is None and sleep_dur_hhmm is None):
-        us_js = _fetch_json("/proxy/usersummary-service/usersummary/daily",
-                            {"calendarDate": day.isoformat()})
-        if DEBUG: logger.info("garmin_usersummary_raw", date=str(day), has=bool(us_js))
-        if us_js:
-            m = _extract_usersummary(us_js)
-            if steps is None and m.get("steps") is not None:
-                try: steps = int(m["steps"])
-                except Exception: pass
-            if active_cals is None and m.get("activeKilocalories") is not None:
-                try: active_cals = int(m["activeKilocalories"])
-                except Exception: pass
-            if rhr is None and m.get("restingHeartRate") is not None:
-                try: rhr = int(m["restingHeartRate"])
-                except Exception: pass
-            if bedtime is None or waketime is None or sleep_dur_hhmm is None:
-                bt = _only_hms_from_ms(m.get("sleepStartTimestampGMT"))
-                wt = _only_hms_from_ms(m.get("sleepEndTimestampGMT"))
-                dur_s = m.get("sleepTimeSeconds")
-                dur_hhmm = _min_to_hhmm(int(seconds_to_minutes(dur_s)) if dur_s is not None else None)
-                bedtime  = bedtime  or bt
-                waketime = waketime or wt
-                sleep_dur_hhmm = sleep_dur_hhmm or dur_hhmm
-                if sleep_score is None and m.get("sleepScore") is not None:
-                    try: sleep_score = int(m["sleepScore"])
-                    except Exception: pass
-
-    # HRV
-    hrv_js = (_fetch_json("/proxy/wellness-service/wellness/dailyHrv", {"date": day.isoformat()})
-              or _fetch_json("/proxy/wellness-service/wellness/hrv", {"date": day.isoformat()}))
-    if DEBUG: logger.info("garmin_hrv_raw", date=str(day), has=bool(hrv_js))
-    hrv_ms = _extract_hrv(hrv_js) if hrv_js else None
-    if rhr is None and isinstance(hrv_js, dict):
-        rhr = _coalesce(hrv_js.get("restingHeartRate"), rhr)
-
-    # Body Battery
-    bb_js = (_fetch_json("/proxy/wellness-service/wellness/bodyBattery", {"date": day.isoformat()})
-             or _fetch_json(f"/proxy/wellness-service/wellness/bodyBattery/{day.isoformat()}"))
-    if DEBUG: logger.info("garmin_bb_raw", date=str(day), has=bool(bb_js))
-    readiness_or_bb = _extract_body_battery(bb_js) if bb_js else None
-
-    rhr_final = _coalesce(lowest_hr_sleep, rhr)
-
-    has_any = any(v is not None for v in (
-        bedtime, waketime, sleep_dur_hhmm, sleep_score,
-        rhr_final, hrv_ms, steps, active_cals, readiness_or_bb
-    ))
+    has_any = any(v is not None for v in (bedtime, waketime, hhmm, sleep_score, lowest_hr, steps, active_cal, readiness_or_bb))
     if not has_any:
         return []
 
     row = UnifiedRow(
         date=iso_date(day),
         source="garmin",
-        bedtime=bedtime,
-        wake_time=waketime,
-        sleep_duration_min=sleep_dur_hhmm,
-        sleep_score=sleep_score,
-        rhr_bpm=rhr_final,
-        hrv_ms=hrv_ms,
-        readiness_or_body_battery_score=readiness_or_bb,
+        bedtime=_only_hms(bedtime),
+        wake_time=_only_hms(waketime),
+        sleep_duration_min=hhmm,
+        sleep_score=sleep_score,  # type: ignore[arg-type]
+        rhr_bpm=lowest_hr,
+        hrv_ms=None,
+        readiness_or_body_battery_score=readiness_or_bb,  # type: ignore[arg-type]
         steps=steps,
-        active_calories=active_cals,
+        active_calories=active_cal,
         activity_score=None,
-    )
-    return [row.as_row()]
+    ).as_row()
+
+    return [row]
+
+

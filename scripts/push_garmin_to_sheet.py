@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/push_polar_to_sheet.py
+# scripts/push_garmin_to_sheet.py
 
 from __future__ import annotations
 
@@ -8,24 +8,23 @@ import datetime as dt
 import os
 from dotenv import load_dotenv
 load_dotenv()
-from typing import List, Dict, Any
+from typing import List, Any
+import time, random
 
-from health_sync.sources import polar
-
-# --- logger (structlog ako postoji, inače standardni logging) ---
+# --- logger ---
 try:
     import structlog  # type: ignore
     logger = structlog.get_logger()
 except Exception:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logger = logging.getLogger("polar_push")
+    logger = logging.getLogger("garmin_push")
 
 # --- Google Sheets SDK ---
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# --- osiguraj da je project root na sys.path (da 'sources' bude importabilan) ---
+# --- sys.path ensure project root ---
 import sys, pathlib
 CURR = pathlib.Path(__file__).resolve()
 ROOT = None
@@ -36,14 +35,13 @@ for p in [CURR.parent, *CURR.parents]:
 if ROOT and str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# --- Polar fetch ---
-from health_sync.sources import polar  # -> polar.fetch_day(day) vraća List[List[Any]]
+# --- Garmin fetch ---
+from health_sync.sources import garmin  # -> garmin.fetch_day(day)
 
 # ---------------------- Sheet helpers ----------------------
 
 from health_sync.models import UnifiedRow
 
-# Finalni redoslijed kolona usklađen s UnifiedRow (A-U = 21 kolona)
 HEADERS = UnifiedRow.headers()
 
 
@@ -61,7 +59,6 @@ def _gsvc():
 
 
 def _col_letter(index_1_based: int) -> str:
-    # Convert 1-based index to Excel-style column letters
     n = int(index_1_based)
     letters = []
     while n > 0:
@@ -80,7 +77,6 @@ def _get_sheet_id(svc, sheet_id: str, tab: str) -> int:
 
 
 def _ensure_header(svc, sheet_id: str, tab: str):
-    # pročitaj prvih 1-2 reda; ako nema headera ili nije isti, upiši ga
     last_col = _col_letter(len(HEADERS))
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{tab}!A1:{last_col}1"
@@ -96,16 +92,13 @@ def _ensure_header(svc, sheet_id: str, tab: str):
         ).execute()
 
 
-def _read_existing_map(svc, sheet_id: str, tab: str) -> Dict[str, int]:
-    """
-    Map existing rows to 1-based row index using key: date|source|source_record_id
-    """
+def _read_existing_map(svc, sheet_id: str, tab: str):
     last_col = _col_letter(len(HEADERS))
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{tab}!A2:{last_col}10000"
     ).execute()
     rows = resp.get("values", []) or []
-    mapping: Dict[str, int] = {}
+    mapping = {}
     src_idx = len(HEADERS) - 1
     for i, r in enumerate(rows, start=2):
         if not r:
@@ -119,8 +112,6 @@ def _read_existing_map(svc, sheet_id: str, tab: str) -> Dict[str, int]:
 
 
 def _pad_to_headers(row: List[Any]) -> List[Any]:
-    # `polar.fetch_day` vraća listu vrijednosti u istom rasporedu kao HEADERS;
-    # ako je kraća, dopuni prazninama.
     padded = list(row)
     if len(padded) < len(HEADERS):
         padded.extend([""] * (len(HEADERS) - len(padded)))
@@ -145,7 +136,6 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
         else:
             to_append.append(row)
 
-    # batch update
     if to_update:
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
@@ -161,7 +151,7 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
             body={"values": to_append},
         ).execute()
 
-    # Nakon izmjena, sortiraj po datumu (A) uzlazno
+    # sort by date
     sheet_tab_id = _get_sheet_id(svc, sheet_id, tab)
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
@@ -178,35 +168,27 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
     ).execute()
 
 
-# ---------------------- Date helpers ----------------------
-
-def daterange(end_date: dt.date, days: int) -> List[dt.date]:
-    # uključivo 'end_date', unatrag 'days' dana
+def daterange(end_date: dt.date, days: int):
     start = end_date - dt.timedelta(days=days - 1)
-    out: List[dt.date] = []
     cur = start
+    out = []
     while cur <= end_date:
         out.append(cur)
         cur += dt.timedelta(days=1)
     return out
 
 
-# ---------------------- Main ----------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Push Polar sleep u Google Sheet")
+    parser = argparse.ArgumentParser(description="Push Garmin daily to Google Sheet")
     parser.add_argument("--sheet-id", default=os.getenv("GSHEET_ID"), required=False)
-    parser.add_argument(
-        "--tab",
-        default=(os.getenv("GSHEET_TAB_POLAR") or "Polar"),
-    )
-    parser.add_argument("--date", help="YYYY-MM-DD (ako se ne zada, koristi danas)")
-    parser.add_argument("--days", type=int, default=1, help="Koliko dana unatrag (default 1)")
+    parser.add_argument("--tab", default=(os.getenv("GSHEET_TAB_GARMIN") or "Garmin"))
+    parser.add_argument("--date", help="YYYY-MM-DD (default today)")
+    parser.add_argument("--days", type=int, default=1, help="How many days back (default 1)")
     args = parser.parse_args()
 
     sheet_id = args.sheet_id
     if not sheet_id:
-        raise SystemExit("Set GSHEET_ID env var ili proslijedi --sheet-id")
+        raise SystemExit("Set GSHEET_ID env var or pass --sheet-id")
 
     if args.date:
         end_date = dt.date.fromisoformat(args.date)
@@ -219,16 +201,34 @@ def main():
     svc = _gsvc()
 
     all_rows: List[List[Any]] = []
+    long_pause_done = False
     for d in dates:
         try:
-            rows = polar.fetch_day(d)  # očekujemo 1 red
+            rows = garmin.fetch_day(d)
             logger.info("fetched", extra={"date": str(d), "rows": len(rows)})
             all_rows.extend(rows)
         except Exception as e:
-            logger.error("fetch_error", extra={"date": str(d), "err": str(e)})
+            msg = str(e).lower()
+            rl = any(tok in msg for tok in ["429", "rate limit", "1015"]) or getattr(e, "status_code", None) in (429, 1015)
+            logger.error("fetch_error", extra={"date": str(d), "err": str(e), "rate_limited": rl})
+            if rl and not long_pause_done:
+                wait_min = random.randint(30, 60)
+                logger.warning("rate_limit_pause", extra={"minutes": wait_min})
+                time.sleep(wait_min * 60)
+                long_pause_done = True
+                # retry once after long pause
+                try:
+                    rows = garmin.fetch_day(d)
+                    logger.info("fetched_after_pause", extra={"date": str(d), "rows": len(rows)})
+                    all_rows.extend(rows)
+                except Exception as e2:
+                    logger.error("fetch_error_after_pause", extra={"date": str(d), "err": str(e2)})
+            # continue to next date
+
+        # gentle pacing between days to avoid bursts
+        time.sleep(random.uniform(5.0, 12.0))
 
     if not all_rows:
-        # structlog: warn je deprecated; standard logging: warning
         try:
             logger.warning("no_rows_to_push")
         except Exception:
@@ -241,3 +241,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
