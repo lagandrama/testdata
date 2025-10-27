@@ -10,7 +10,28 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import List, Dict, Any
 
-from health_sync.sources import polar
+# --- osiguraj da je project root na sys.path PRIJE bilo kakvih import-a paketa ---
+import sys, pathlib
+CURR = pathlib.Path(__file__).resolve()
+
+ROOT = None
+for p in [CURR.parent, *CURR.parents]:
+    # preferirani slučaj: .../health_sync/sources/
+    if (p / "health_sync" / "sources").exists():
+        ROOT = p
+        break
+    # fallback: projekt bez top-level paketa, samo sources/
+    if (p / "sources").exists():
+        ROOT = p
+        break
+
+if ROOT and str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# dodatno: ako postoji health_sync/ dodaj i njega
+if ROOT and (pathlib.Path(ROOT) / "health_sync").exists():
+    pkg_root = str(pathlib.Path(ROOT) / "health_sync")
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
 
 # --- logger (structlog ako postoji, inače standardni logging) ---
 try:
@@ -25,23 +46,18 @@ except Exception:
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# --- osiguraj da je project root na sys.path (da 'sources' bude importabilan) ---
-import sys, pathlib
-CURR = pathlib.Path(__file__).resolve()
-ROOT = None
-for p in [CURR.parent, *CURR.parents]:
-    if (p / "sources").exists():
-        ROOT = p
-        break
-if ROOT and str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-# --- Polar fetch ---
-from health_sync.sources import polar  # -> polar.fetch_day(day) vraća List[List[Any]]
+# --- Polar fetch (pokušaj kao health_sync.sources, pa kao standalone sources) ---
+try:
+    from health_sync.sources import polar  # noqa: F401
+except ModuleNotFoundError:
+    from sources import polar  # type: ignore
 
 # ---------------------- Sheet helpers ----------------------
 
-from health_sync.models import UnifiedRow
+if 'health_sync' in sys.modules:
+    from health_sync.models import UnifiedRow  # type: ignore
+else:
+    from models import UnifiedRow  # fallback kada nema top-level paketa
 
 # Finalni redoslijed kolona usklađen s UnifiedRow (A-U = 21 kolona)
 HEADERS = UnifiedRow.headers()
@@ -61,7 +77,6 @@ def _gsvc():
 
 
 def _col_letter(index_1_based: int) -> str:
-    # Convert 1-based index to Excel-style column letters
     n = int(index_1_based)
     letters = []
     while n > 0:
@@ -80,7 +95,6 @@ def _get_sheet_id(svc, sheet_id: str, tab: str) -> int:
 
 
 def _ensure_header(svc, sheet_id: str, tab: str):
-    # pročitaj prvih 1-2 reda; ako nema headera ili nije isti, upiši ga
     last_col = _col_letter(len(HEADERS))
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{tab}!A1:{last_col}1"
@@ -97,9 +111,6 @@ def _ensure_header(svc, sheet_id: str, tab: str):
 
 
 def _read_existing_map(svc, sheet_id: str, tab: str) -> Dict[str, int]:
-    """
-    Map existing rows to 1-based row index using key: date|source|source_record_id
-    """
     last_col = _col_letter(len(HEADERS))
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sheet_id, range=f"{tab}!A2:{last_col}10000"
@@ -119,8 +130,6 @@ def _read_existing_map(svc, sheet_id: str, tab: str) -> Dict[str, int]:
 
 
 def _pad_to_headers(row: List[Any]) -> List[Any]:
-    # `polar.fetch_day` vraća listu vrijednosti u istom rasporedu kao HEADERS;
-    # ako je kraća, dopuni prazninama.
     padded = list(row)
     if len(padded) < len(HEADERS):
         padded.extend([""] * (len(HEADERS) - len(padded)))
@@ -131,12 +140,11 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
     _ensure_header(svc, sheet_id, tab)
     existing = _read_existing_map(svc, sheet_id, tab)
 
-    to_update = []
-    to_append = []
+    to_update, to_append = [], []
 
     for row in rows:
         row = _pad_to_headers(row)
-        key = f"{row[0]}|{row[1]}"  # date|source
+        key = f"{row[0]}|{row[1]}"
         if key in existing:
             row_idx = existing[key]
             last_col = _col_letter(len(HEADERS))
@@ -145,7 +153,6 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
         else:
             to_append.append(row)
 
-    # batch update
     if to_update:
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
@@ -161,7 +168,6 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
             body={"values": to_append},
         ).execute()
 
-    # Nakon izmjena, sortiraj po datumu (A) uzlazno
     sheet_tab_id = _get_sheet_id(svc, sheet_id, tab)
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
@@ -178,10 +184,7 @@ def upsert_rows(svc, sheet_id: str, tab: str, rows: List[List[Any]]):
     ).execute()
 
 
-# ---------------------- Date helpers ----------------------
-
 def daterange(end_date: dt.date, days: int) -> List[dt.date]:
-    # uključivo 'end_date', unatrag 'days' dana
     start = end_date - dt.timedelta(days=days - 1)
     out: List[dt.date] = []
     cur = start
@@ -191,15 +194,10 @@ def daterange(end_date: dt.date, days: int) -> List[dt.date]:
     return out
 
 
-# ---------------------- Main ----------------------
-
 def main():
     parser = argparse.ArgumentParser(description="Push Polar sleep u Google Sheet")
     parser.add_argument("--sheet-id", default=os.getenv("GSHEET_ID"), required=False)
-    parser.add_argument(
-        "--tab",
-        default=(os.getenv("GSHEET_TAB_POLAR") or "Polar"),
-    )
+    parser.add_argument("--tab", default=(os.getenv("GSHEET_TAB_POLAR") or "Polar"))
     parser.add_argument("--date", help="YYYY-MM-DD (ako se ne zada, koristi danas)")
     parser.add_argument("--days", type=int, default=1, help="Koliko dana unatrag (default 1)")
     args = parser.parse_args()
@@ -208,27 +206,21 @@ def main():
     if not sheet_id:
         raise SystemExit("Set GSHEET_ID env var ili proslijedi --sheet-id")
 
-    if args.date:
-        end_date = dt.date.fromisoformat(args.date)
-    else:
-        end_date = dt.date.today()
-
-    days = max(1, int(args.days))
-    dates = daterange(end_date, days)
+    end_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+    dates = daterange(end_date, max(1, int(args.days)))
 
     svc = _gsvc()
 
     all_rows: List[List[Any]] = []
     for d in dates:
         try:
-            rows = polar.fetch_day(d)  # očekujemo 1 red
+            rows = polar.fetch_day(d)
             logger.info("fetched", extra={"date": str(d), "rows": len(rows)})
             all_rows.extend(rows)
         except Exception as e:
             logger.error("fetch_error", extra={"date": str(d), "err": str(e)})
 
     if not all_rows:
-        # structlog: warn je deprecated; standard logging: warning
         try:
             logger.warning("no_rows_to_push")
         except Exception:

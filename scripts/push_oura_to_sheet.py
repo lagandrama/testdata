@@ -7,8 +7,40 @@ from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv(), override=True)
 
-from health_sync.sources.oura import fetch_day
-from health_sync.models import UnifiedRow  # headers + redoslijed
+# --- osiguraj da je project root na sys.path PRIJE bilo kakvih import-a paketa ---
+import sys, pathlib
+CURR = pathlib.Path(__file__).resolve()
+
+ROOT = None
+for p in [CURR.parent, *CURR.parents]:
+    # preferirani slučaj: .../health_sync/sources/
+    if (p / "health_sync" / "sources").exists():
+        ROOT = p
+        break
+    # fallback: projekt bez top-level paketa, samo sources/
+    if (p / "sources").exists():
+        ROOT = p
+        break
+
+if ROOT and str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# dodatno: ako postoji health_sync/ dodaj i njega
+if ROOT and (pathlib.Path(ROOT) / "health_sync").exists():
+    pkg_root = str(pathlib.Path(ROOT) / "health_sync")
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+
+# --- Oura fetch (pokušaj kao health_sync.sources, pa kao standalone sources) ---
+try:
+    from health_sync.sources import oura  # noqa: F401
+except ModuleNotFoundError:
+    from sources import oura  # type: ignore
+
+# --- Model (UnifiedRow) s fallback-om ---
+if 'health_sync' in sys.modules:
+    from health_sync.models import UnifiedRow  # type: ignore
+else:
+    from models import UnifiedRow  # type: ignore
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "secrets/service_account.json")
@@ -92,7 +124,7 @@ def main():
 
     all_rows: List[List] = []
     for d in dates:
-        all_rows.extend(fetch_day(d))
+        all_rows.extend(oura.fetch_day(d))
     if not all_rows:
         print("Nema redaka za upis.")
         return
